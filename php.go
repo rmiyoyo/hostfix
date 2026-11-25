@@ -45,14 +45,14 @@ func discoverPHP(e *Env) []PHPBinary {
 				continue
 			}
 			version := m[1] + "." + m[2]
-			if seen[version] || !isExecutable(path) {
+			if seen[path] || !isExecutable(path) {
 				continue
 			}
-			seen[version] = true
+			seen[path] = true
 			found = append(found, PHPBinary{Version: version, Path: path, Source: loc.source})
 		}
 	}
-	sort.Slice(found, func(i, j int) bool {
+	sort.SliceStable(found, func(i, j int) bool {
 		a, _ := parseVersion(found[i].Version)
 		b, _ := parseVersion(found[j].Version)
 		return compareVersions(a, b) < 0
@@ -60,14 +60,20 @@ func discoverPHP(e *Env) []PHPBinary {
 	return found
 }
 
-const phpProbe = `echo PHP_VERSION, "\n", implode(",", get_loaded_extensions()), "\n", ini_get("disable_functions"), "\n", ini_get("memory_limit"), "\n";`
+const probeMarker = "@@hostfix-probe@@"
+
+const phpProbe = `echo "` + probeMarker + `\n", PHP_VERSION, "\n", implode(",", get_loaded_extensions()), "\n", ini_get("disable_functions"), "\n", ini_get("memory_limit"), "\n";`
 
 func probePHP(e *Env, bin string) (*PHPInfo, error) {
 	out, err := e.Exec(bin, "-r", phpProbe)
 	if err != nil {
 		return nil, fmt.Errorf("could not run %s: %s", bin, firstLine(out, err))
 	}
-	lines := strings.Split(strings.ReplaceAll(out, "\r", ""), "\n")
+	_, body, found := strings.Cut(strings.ReplaceAll(out, "\r", ""), probeMarker+"\n")
+	if !found {
+		return nil, fmt.Errorf("unexpected output from %s: %s", bin, firstLine(out, nil))
+	}
+	lines := strings.Split(body, "\n")
 	for len(lines) < 4 {
 		lines = append(lines, "")
 	}
@@ -98,11 +104,14 @@ func firstLine(out string, err error) string {
 }
 
 func normalizePHPVersion(s string) string {
-	s = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(s), "php"))
+	s = strings.ToLower(strings.TrimSpace(s))
+	for _, prefix := range []string{"ea-php", "alt-php", "php"} {
+		s = strings.TrimPrefix(s, prefix)
+	}
 	if m := regexp.MustCompile(`^(\d)(\d+)$`).FindStringSubmatch(s); m != nil {
 		return m[1] + "." + m[2]
 	}
-	if v, parts, ok := parsePartial(s); ok && parts >= 2 {
+	if v, parts, _, ok := parsePartial(s); ok && parts >= 2 {
 		return v.MajorMinor()
 	}
 	return s
@@ -114,8 +123,10 @@ type PHPRequirements struct {
 }
 
 type composerFile struct {
-	Require    map[string]string `json:"require"`
-	RequireDev map[string]string `json:"require-dev"`
+	Require map[string]string `json:"require"`
+	Config  struct {
+		Platform map[string]any `json:"platform"`
+	} `json:"config"`
 }
 
 type composerLock struct {
@@ -162,7 +173,9 @@ func readPHPRequirements(dir string) (*PHPRequirements, error) {
 		}
 	}
 	for ext := range exts {
-		req.Extensions = append(req.Extensions, ext)
+		if _, faked := root.Config.Platform["ext-"+ext]; !faked {
+			req.Extensions = append(req.Extensions, ext)
+		}
 	}
 	sort.Strings(req.Extensions)
 	return req, nil
@@ -282,7 +295,12 @@ func phpUse(e *Env, want, dir string) (PHPBinary, error) {
 		}
 		chosen = bins[i]
 	}
-	if err := replaceSymlink(chosen.Path, filepath.Join(e.binDir(), "php")); err != nil {
+	link := filepath.Join(e.binDir(), "php")
+	saved, err := moveAside(e, link)
+	if err != nil {
+		return chosen, err
+	}
+	if err := replaceSymlink(chosen.Path, link); err != nil {
 		return chosen, err
 	}
 	if err := writeComposerWrapper(e); err != nil {
@@ -292,6 +310,9 @@ func phpUse(e *Env, want, dir string) (PHPBinary, error) {
 		return chosen, err
 	}
 	e.done("Command line PHP is now %s (%s)", chosen.Version, chosen.Path)
+	if saved != "" {
+		e.say("  Your previous %s was moved to %s", tildePath(e, link), tildePath(e, saved))
+	}
 	e.say("  This covers SSH, Composer and artisan. Cron jobs need the full path: run `hostfix cron`.")
 	if web, source := webPHP(e, dir); web != "" && web != chosen.Version {
 		e.note("The website in %s runs PHP %s (%s). Run `hostfix php web %s` to match.", tildePath(e, dir), web, source, chosen.Version)
@@ -302,18 +323,35 @@ func phpUse(e *Env, want, dir string) (PHPBinary, error) {
 func joinVersions(bins []PHPBinary) string {
 	var out []string
 	for _, b := range bins {
-		out = append(out, b.Version)
+		if !slices.Contains(out, b.Version) {
+			out = append(out, b.Version)
+		}
 	}
 	return strings.Join(out, ", ")
 }
 
-var handlerPattern = regexp.MustCompile(`(?im)^\s*AddHandler\s+application/x-httpd-(ea-php|alt-php)(\d)(\d+)`)
+var (
+	handlerPattern  = regexp.MustCompile(`(?im)^\s*AddHandler\s+application/x-(?:httpd-(?:ea-|alt-)?|)(?:php|lsphp)(\d)(\d+)`)
+	selectorPattern = regexp.MustCompile(`(?im)^\s*AddHandler\s+application/x-httpd-lsphp\s`)
+	defaultPattern  = regexp.MustCompile(`"?default"?\s*[:=]\s*"?(?:ea-|alt-)?php(\d)(\d+)`)
+)
+
+func webDir(dir string) string {
+	if public := filepath.Join(dir, "public"); isLaravel(dir) && exists(public) {
+		return public
+	}
+	return dir
+}
 
 func webPHP(e *Env, dir string) (string, string) {
-	for d := dir; ; {
+	for d := webDir(dir); ; {
 		if data, err := os.ReadFile(filepath.Join(d, ".htaccess")); err == nil {
-			if m := handlerPattern.FindStringSubmatch(string(data)); m != nil {
-				return m[2] + "." + m[3], tildePath(e, filepath.Join(d, ".htaccess"))
+			if all := handlerPattern.FindAllStringSubmatch(string(data), -1); len(all) > 0 {
+				m := all[len(all)-1]
+				return m[1] + "." + m[2], tildePath(e, filepath.Join(d, ".htaccess"))
+			}
+			if selectorPattern.Match(data) {
+				return "", "cPanel > Select PHP Version"
 			}
 		}
 		parent := filepath.Dir(d)
@@ -322,13 +360,10 @@ func webPHP(e *Env, dir string) (string, string) {
 		}
 		d = parent
 	}
-	if data, err := os.ReadFile(e.sys("/etc/cpanel/ea4/ea4.conf")); err == nil {
-		var conf struct {
-			Default string `json:"default"`
-		}
-		if json.Unmarshal(data, &conf) == nil {
-			if m := regexp.MustCompile(`php(\d)(\d+)`).FindStringSubmatch(conf.Default); m != nil {
-				return m[1] + "." + m[2], "server default"
+	for _, conf := range []string{"/etc/cpanel/ea4/php.conf", "/etc/cpanel/ea4/ea4.conf"} {
+		if data, err := os.ReadFile(e.sys(conf)); err == nil {
+			if m := defaultPattern.FindSubmatch(data); m != nil {
+				return string(m[1]) + "." + string(m[2]), "server default"
 			}
 		}
 	}
@@ -340,6 +375,29 @@ const (
 	handlerEnd   = "# php -- END cPanel-generated handler, do not edit"
 )
 
+func stripBlock(content, begin, end string) ([]string, error) {
+	var kept []string
+	skip := false
+	for _, line := range strings.Split(strings.TrimRight(content, "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == begin:
+			skip = true
+		case trimmed == end:
+			skip = false
+		case !skip:
+			kept = append(kept, line)
+		}
+	}
+	if skip {
+		return nil, fmt.Errorf("found %q without a matching end line; fix the file by hand first", begin)
+	}
+	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+		kept = kept[:len(kept)-1]
+	}
+	return kept, nil
+}
+
 func phpWeb(e *Env, want, dir string) error {
 	version := normalizePHPVersion(want)
 	pkg := "ea-php" + strings.ReplaceAll(version, ".", "")
@@ -349,25 +407,15 @@ func phpWeb(e *Env, want, dir string) error {
 		}
 		return fmt.Errorf("%s is not installed on this server", pkg)
 	}
-	path := filepath.Join(dir, ".htaccess")
+	site := webDir(dir)
+	path := filepath.Join(site, ".htaccess")
 	data, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	var kept []string
-	skip := false
-	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
-		switch {
-		case strings.TrimSpace(line) == handlerBegin:
-			skip = true
-		case strings.TrimSpace(line) == handlerEnd:
-			skip = false
-		case !skip:
-			kept = append(kept, line)
-		}
-	}
-	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
-		kept = kept[:len(kept)-1]
+	kept, err := stripBlock(string(data), handlerBegin, handlerEnd)
+	if err != nil {
+		return fmt.Errorf("%s: %w", tildePath(e, path), err)
 	}
 	block := []string{
 		handlerBegin,
@@ -382,17 +430,17 @@ func phpWeb(e *Env, want, dir string) error {
 	}
 	out := strings.Join(append(kept, block...), "\n") + "\n"
 	if out == string(data) {
-		e.done("%s already runs PHP %s", tildePath(e, dir), version)
+		e.done("%s already runs PHP %s", tildePath(e, site), version)
 		return nil
 	}
 	saved, err := backup(e, path)
 	if err != nil {
 		return err
 	}
-	if err := writeFileKeepMode(path, []byte(out), 0o644); err != nil {
+	if err := writeFileAtomic(path, []byte(out), 0o644); err != nil {
 		return err
 	}
-	e.done("The website in %s now runs PHP %s", tildePath(e, dir), version)
+	e.done("The website in %s now runs PHP %s", tildePath(e, site), version)
 	if saved != "" {
 		e.say("  Previous .htaccess saved as %s", tildePath(e, saved))
 	}

@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"slices"
 )
 
 func fix(e *Env, dir string) int {
@@ -15,9 +14,7 @@ func fix(e *Env, dir string) int {
 	}
 
 	step(setupShell(e, false))
-	if !slices.Contains(filepath.SplitList(e.Path), e.binDir()) {
-		e.prependPath(e.binDir())
-	}
+	e.pathFirst(e.binDir())
 
 	req, err := readPHPRequirements(dir)
 	step(err)
@@ -40,7 +37,9 @@ func fix(e *Env, dir string) int {
 
 	if cache := npmCache(e); cache != "" && !writable(cache) {
 		newCache := filepath.Join(e.Home, ".npm-cache")
-		if _, err := e.Exec(e.lookPath("npm"), "config", "set", "cache", newCache); err == nil {
+		if out, err := e.Exec(e.lookPath("npm"), "config", "set", "cache", newCache); err != nil {
+			e.note("could not move the npm cache: %s", firstLine(out, err))
+		} else {
 			os.MkdirAll(newCache, 0o755)
 			e.done("Moved the npm cache to ~/.npm-cache")
 		}
@@ -79,5 +78,5 @@ func needsNode(e *Env, project *nodeProject) bool {
 		return true
 	}
 	v, _ := parseVersion(out)
-	return project.Engine != "" && !satisfies(project.Engine, v)
+	return project.Engine != "" && !satisfiesNPM(project.Engine, v)
 }

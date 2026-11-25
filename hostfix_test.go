@@ -68,7 +68,7 @@ func (f *fakeServer) addPHP(version, source, extensions, disabled string) string
 		path = filepath.Join(f.env.Root, "opt", "alt", "php"+digits, "usr", "bin", "php")
 	}
 	f.writeExec(path)
-	f.byPath[path] = fmt.Sprintf("%s.4\n%s\n%s\n128M\n", version, extensions, disabled)
+	f.byPath[path] = probeMarker + "\n" + fmt.Sprintf("%s.4\n%s\n%s\n128M\n", version, extensions, disabled)
 	return path
 }
 
@@ -110,7 +110,7 @@ func TestDiscoverPHP(t *testing.T) {
 	for _, b := range got {
 		summary = append(summary, b.Version+" "+b.Source)
 	}
-	if want := "7.4 alt-php,8.1 ea-php,8.3 ea-php"; strings.Join(summary, ",") != want {
+	if want := "7.4 alt-php,8.1 ea-php,8.3 ea-php,8.3 alt-php"; strings.Join(summary, ",") != want {
 		t.Fatalf("got %v, want %s", summary, want)
 	}
 }
@@ -267,7 +267,7 @@ func TestStorageLinkAndCron(t *testing.T) {
 
 	f.out.Reset()
 	must(t, printCron(f.env, dir))
-	if want := fmt.Sprintf("* * * * * cd %s && %s artisan schedule:run", dir, php); !strings.Contains(f.out.String(), want) {
+	if want := fmt.Sprintf("* * * * * cd %s && %s artisan schedule:run", shellQuote(dir), shellQuote(php)); !strings.Contains(f.out.String(), want) {
 		t.Fatalf("cron output %q does not contain %q", f.out.String(), want)
 	}
 }
@@ -278,11 +278,11 @@ func TestDocrootNeedsYesAndKeepsOldFolder(t *testing.T) {
 	f.write("app/public/index.php", "<?php", 0o644)
 	f.write("public_html/old.html", "old", 0o644)
 
-	must(t, docroot(f.env, dir, false))
+	must(t, docroot(f.env, dir, false, false))
 	if info, _ := os.Lstat(filepath.Join(f.env.Home, "public_html")); info.Mode()&os.ModeSymlink != 0 {
 		t.Fatal("changed public_html without --yes")
 	}
-	must(t, docroot(f.env, dir, true))
+	must(t, docroot(f.env, dir, true, false))
 	if readFile(t, filepath.Join(f.env.Home, "public_html", "index.php")) != "<?php" {
 		t.Fatal("public_html does not serve the Laravel public folder")
 	}

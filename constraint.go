@@ -28,102 +28,138 @@ func compareVersions(a, b Version) int {
 	return 0
 }
 
-var versionPrefix = regexp.MustCompile(`^v?(\d+)(?:\.(\d+|[x*]))?(?:\.(\d+|[x*]))?`)
+var versionPrefix = regexp.MustCompile(`^v?(\d+)(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?`)
 
-func parsePartial(s string) (Version, int, bool) {
+func parsePartial(s string) (Version, int, bool, bool) {
 	m := versionPrefix.FindStringSubmatch(strings.TrimSpace(s))
 	if m == nil {
-		return Version{}, 0, false
+		return Version{}, 0, false, false
 	}
 	var v Version
 	parts := 0
+	wildcard := false
 	for i := 1; i <= 3; i++ {
-		if m[i] == "" || m[i] == "x" || m[i] == "*" {
+		if m[i] == "" {
+			break
+		}
+		if m[i] == "x" || m[i] == "X" || m[i] == "*" {
+			wildcard = true
 			break
 		}
 		v[i-1], _ = strconv.Atoi(m[i])
 		parts++
 	}
-	return v, parts, true
+	return v, parts, wildcard, true
 }
 
 func parseVersion(s string) (Version, bool) {
-	v, _, ok := parsePartial(s)
+	v, _, _, ok := parsePartial(s)
 	return v, ok
 }
+
+type constraintStyle int
+
+const (
+	composerStyle constraintStyle = iota
+	npmStyle
+)
 
 var (
 	orSplit         = regexp.MustCompile(`\s*\|\|?\s*`)
 	hyphenRange     = regexp.MustCompile(`(\S+)\s+-\s+(\S+)`)
-	operatorSpace   = regexp.MustCompile(`(>=|<=|!=|==|>|<|=|\^|~)\s+`)
+	operatorSpace   = regexp.MustCompile(`(>=|<=|!=|<>|==|>|<|=|\^|~)\s+`)
 	andSplit        = regexp.MustCompile(`[\s,]+`)
 	stabilitySuffix = regexp.MustCompile(`@\w+$`)
+	anyVersion      = regexp.MustCompile(`^[xX*](\.[xX*])*$`)
 )
 
 func satisfies(constraint string, v Version) bool {
+	return satisfiesStyle(constraint, v, composerStyle)
+}
+
+func satisfiesNPM(constraint string, v Version) bool {
+	return satisfiesStyle(constraint, v, npmStyle)
+}
+
+func satisfiesStyle(constraint string, v Version, style constraintStyle) bool {
 	constraint = strings.TrimSpace(constraint)
 	if constraint == "" {
 		return true
 	}
 	for _, alternative := range orSplit.Split(constraint, -1) {
-		if satisfiesAll(alternative, v) {
+		if satisfiesAll(alternative, v, style) {
 			return true
 		}
 	}
 	return false
 }
 
-func satisfiesAll(group string, v Version) bool {
-	group = hyphenRange.ReplaceAllString(group, ">=$1 <=$2")
+func satisfiesAll(group string, v Version, style constraintStyle) bool {
+	group = hyphenRange.ReplaceAllString(group, ">=$1 <=*$2")
 	group = operatorSpace.ReplaceAllString(group, "$1")
 	for _, token := range andSplit.Split(strings.TrimSpace(group), -1) {
-		if token != "" && !satisfiesOne(stabilitySuffix.ReplaceAllString(token, ""), v) {
+		if token != "" && !satisfiesOne(stabilitySuffix.ReplaceAllString(token, ""), v, style) {
 			return false
 		}
 	}
 	return true
 }
 
-func satisfiesOne(token string, v Version) bool {
-	if token == "*" || token == "x" || token == "" {
+func satisfiesOne(token string, v Version, style constraintStyle) bool {
+	if token == "" || anyVersion.MatchString(token) {
 		return true
 	}
 	op := ""
-	for _, candidate := range []string{">=", "<=", "!=", "==", ">", "<", "=", "^", "~"} {
+	for _, candidate := range []string{"<=*", ">=", "<=", "!=", "<>", "==", ">", "<", "=", "^", "~"} {
 		if strings.HasPrefix(token, candidate) {
 			op = candidate
 			break
 		}
 	}
-	target, parts, ok := parsePartial(strings.TrimPrefix(token, op))
+	target, parts, wildcard, ok := parsePartial(strings.TrimPrefix(token, op))
 	if !ok {
 		return false
 	}
+	if parts == 0 {
+		return op == "" || op == "=" || op == "==" || op == ">="
+	}
+	partial := parts < 3 && (style == npmStyle || wildcard)
 	cmp := compareVersions(v, target)
 	switch op {
 	case ">=":
 		return cmp >= 0
 	case ">":
+		if partial {
+			return compareVersions(v, bump(target, parts)) >= 0
+		}
 		return cmp > 0
+	case "<=*":
+		return compareVersions(v, bump(target, parts)) < 0
 	case "<=":
-		if parts < 3 {
+		if partial {
 			return compareVersions(v, bump(target, parts)) < 0
 		}
 		return cmp <= 0
 	case "<":
 		return cmp < 0
-	case "!=":
-		return !matchesPrefix(v, target, parts)
+	case "!=", "<>":
+		if partial {
+			return !matchesPrefix(v, target, parts)
+		}
+		return cmp != 0
 	case "^":
 		return cmp >= 0 && compareVersions(v, caretLimit(target, parts)) < 0
 	case "~":
-		limitParts := parts - 1
-		if limitParts < 1 {
-			limitParts = 1
+		limit := parts - 1
+		if style == npmStyle {
+			limit = min(parts, 2)
 		}
-		return cmp >= 0 && compareVersions(v, bump(target, limitParts)) < 0
+		return cmp >= 0 && compareVersions(v, bump(target, max(limit, 1))) < 0
 	default:
-		return matchesPrefix(v, target, parts)
+		if partial {
+			return matchesPrefix(v, target, parts)
+		}
+		return cmp == 0
 	}
 }
 

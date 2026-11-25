@@ -69,7 +69,7 @@ func doctor(e *Env, dir string) int {
 
 func checkShell(e *Env, r *report) {
 	r.section("Shell")
-	inPath := slices.Contains(filepath.SplitList(e.Path), e.binDir())
+	inPath := e.inPath(e.binDir())
 	switch {
 	case !shellConfigured(e):
 		r.warn("~/.bashrc does not put ~/.local/bin first in PATH, so tools installed there are not found", "hostfix shell")
@@ -108,7 +108,9 @@ func checkPHP(e *Env, r *report, dir string) *PHPInfo {
 		return nil
 	}
 	r.ok("Command line PHP %s (%s)", info.Version, tildePath(e, php))
-	if web, source := webPHP(e, dir); web != "" {
+	if web, source := webPHP(e, dir); web == "" && source != "" {
+		r.info("The website PHP version is set in %s", source)
+	} else if web != "" {
 		if web != info.Version.MajorMinor() {
 			r.warn(fmt.Sprintf("The website runs PHP %s (%s) but the command line runs %s. Composer and artisan use the command line one.", web, source, info.Version.MajorMinor()),
 				"hostfix php use "+web+"   or   hostfix php web "+info.Version.MajorMinor())
@@ -196,7 +198,7 @@ func checkNode(e *Env, r *report, dir string) *nodeProject {
 	}
 	v, _ := parseVersion(out)
 	r.ok("Node.js %s (%s)", v, tildePath(e, node))
-	if project != nil && project.Engine != "" && !satisfies(project.Engine, v) {
+	if project != nil && project.Engine != "" && !satisfiesNPM(project.Engine, v) {
 		r.fail(fmt.Sprintf("package.json needs Node.js %s", project.Engine), "hostfix node install auto")
 	}
 	if cache := npmCache(e); cache != "" && !writable(cache) {
@@ -211,10 +213,15 @@ func npmCache(e *Env) string {
 		return ""
 	}
 	out, err := e.Exec(npm, "config", "get", "cache")
-	if err != nil || !exists(out) {
+	if err != nil {
 		return ""
 	}
-	return out
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	cache := strings.TrimSpace(lines[len(lines)-1])
+	if !exists(cache) {
+		return ""
+	}
+	return cache
 }
 
 func writable(dir string) bool {
@@ -237,14 +244,12 @@ func checkLimits(e *Env, r *report, project *nodeProject) {
 			r.ok("Memory limit %s", humanBytes(mem))
 		}
 	}
-	if out, err := e.Exec("sh", "-c", "ulimit -u"); err == nil {
-		if n, err := strconv.Atoi(strings.TrimSpace(out)); err == nil {
-			if n < 100 {
-				r.warn(fmt.Sprintf("Process limit is %d. npm, Composer and builds can fail with EAGAIN or \"fork: Resource temporarily unavailable\".", n),
-					"run fewer things at once, or ask your host for a higher limit")
-			} else {
-				r.ok("Process limit %d", n)
-			}
+	if n := processLimit(e); n > 0 {
+		if n < 100 {
+			r.warn(fmt.Sprintf("Process limit is %d. npm, Composer and builds can fail with EAGAIN or \"fork: Resource temporarily unavailable\".", n),
+				"run fewer things at once, or ask your host for a higher limit")
+		} else {
+			r.ok("Process limit %d", n)
 		}
 	}
 }
@@ -256,7 +261,22 @@ func memoryLimit(e *Env) int64 {
 			best = n
 		}
 	}
-	for _, path := range []string{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"} {
+	paths := []string{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"}
+	if data, err := os.ReadFile(e.sys("/proc/self/cgroup")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) != 3 || parts[2] == "/" || parts[2] == "" {
+				continue
+			}
+			switch {
+			case parts[0] == "0" && parts[1] == "":
+				paths = append(paths, "/sys/fs/cgroup"+parts[2]+"/memory.max")
+			case strings.Contains(","+parts[1]+",", ",memory,"):
+				paths = append(paths, "/sys/fs/cgroup/memory"+parts[2]+"/memory.limit_in_bytes")
+			}
+		}
+	}
+	for _, path := range paths {
 		if data, err := os.ReadFile(e.sys(path)); err == nil {
 			if n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
 				consider(n)
@@ -270,6 +290,21 @@ func memoryLimit(e *Env) int64 {
 		}
 	}
 	return best
+}
+
+var processLine = regexp.MustCompile(`(?m)^Max processes\s+(\S+)`)
+
+func processLimit(e *Env) int {
+	data, err := os.ReadFile(e.sys("/proc/self/limits"))
+	if err != nil {
+		return 0
+	}
+	m := processLine.FindSubmatch(data)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(string(m[1]))
+	return n
 }
 
 func parseBytes(s string) int64 {
@@ -322,6 +357,12 @@ func checkFiles(e *Env, r *report, dir string) {
 	for _, c := range changes {
 		counts[c.Reason]++
 	}
+	if counts[reasonForeign] > 0 {
+		r.warn(fmt.Sprintf("%s: %s", plural(counts[reasonForeign], "path"), reasonForeign), "")
+	}
+	if counts[reasonWeb] > 0 {
+		r.fail(fmt.Sprintf("%s: %s", plural(counts[reasonWeb], "path"), reasonWeb), "hostfix perms")
+	}
 	if counts[reasonWritable] > 0 {
 		r.fail(fmt.Sprintf("%s: %s", plural(counts[reasonWritable], "path"), reasonWritable), "hostfix perms")
 	}
@@ -336,7 +377,10 @@ func checkFiles(e *Env, r *report, dir string) {
 	}
 }
 
-var cachedPath = regexp.MustCompile(`'(/[^']*?)/storage/`)
+var (
+	cachedPath    = regexp.MustCompile(`'(/[^']*?)/storage/`)
+	cachedWinPath = regexp.MustCompile(`'([A-Za-z]:\\[^']*?)\\storage`)
+)
 
 func checkLaravel(e *Env, r *report, dir string) {
 	if !isLaravel(dir) {
@@ -362,12 +406,18 @@ func checkLaravel(e *Env, r *report, dir string) {
 	}
 	if data, err := os.ReadFile(filepath.Join(dir, "bootstrap", "cache", "config.php")); err == nil {
 		real, _ := filepath.EvalSymlinks(dir)
+		foreign := ""
+		if m := cachedWinPath.FindStringSubmatch(string(data)); m != nil {
+			foreign = m[1]
+		}
 		for _, m := range cachedPath.FindAllStringSubmatch(string(data), 5) {
-			if m[1] != dir && m[1] != real {
-				r.fail(fmt.Sprintf("bootstrap/cache/config.php points at %s, so it was cached on another machine (\"failed to open stream\" errors)", m[1]),
-					"php artisan config:clear")
-				break
+			if foreign == "" && m[1] != dir && m[1] != real && !strings.HasPrefix(dir, m[1]+"/") {
+				foreign = m[1]
 			}
+		}
+		if foreign != "" {
+			r.fail(fmt.Sprintf("bootstrap/cache/config.php points at %s, so it was cached on another machine (\"failed to open stream\" errors)", foreign),
+				"php artisan config:clear")
 		}
 	}
 }

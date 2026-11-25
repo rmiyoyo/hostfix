@@ -28,6 +28,8 @@ func (r nodeRelease) parsed() Version {
 	return v
 }
 
+var errNoRelease = errors.New("no matching Node.js release")
+
 func chooseNode(releases []nodeRelease, want, flavor string) (nodeRelease, error) {
 	var candidates []nodeRelease
 	for _, r := range releases {
@@ -36,7 +38,7 @@ func chooseNode(releases []nodeRelease, want, flavor string) (nodeRelease, error
 		}
 	}
 	slices.SortFunc(candidates, func(a, b nodeRelease) int { return compareVersions(b.parsed(), a.parsed()) })
-	want = strings.TrimPrefix(strings.TrimSpace(want), "v")
+	want = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(want), "v"))
 	pick := func(match func(nodeRelease) bool) (nodeRelease, bool) {
 		i := slices.IndexFunc(candidates, match)
 		if i < 0 {
@@ -44,24 +46,27 @@ func chooseNode(releases []nodeRelease, want, flavor string) (nodeRelease, error
 		}
 		return candidates[i], true
 	}
+	var found nodeRelease
+	ok := false
 	switch {
-	case want == "" || want == "lts":
-		if r, ok := pick(nodeRelease.isLTS); ok {
-			return r, nil
-		}
+	case want == "" || want == "lts" || want == "lts/*":
+		found, ok = pick(nodeRelease.isLTS)
+	case want == "node" || want == "latest" || want == "current" || want == "stable":
+		found, ok = pick(func(nodeRelease) bool { return true })
+	case strings.HasPrefix(want, "lts/"):
+		name := strings.TrimPrefix(want, "lts/")
+		found, ok = pick(func(r nodeRelease) bool { s, _ := r.LTS.(string); return strings.EqualFold(s, name) })
 	case regexp.MustCompile(`^\d+(\.\d+){0,2}$`).MatchString(want):
-		if r, ok := pick(func(r nodeRelease) bool { return satisfies(want, r.parsed()) }); ok {
-			return r, nil
-		}
+		found, ok = pick(func(r nodeRelease) bool { return satisfiesNPM(want, r.parsed()) })
 	default:
-		if r, ok := pick(func(r nodeRelease) bool { return r.isLTS() && satisfies(want, r.parsed()) }); ok {
-			return r, nil
-		}
-		if r, ok := pick(func(r nodeRelease) bool { return satisfies(want, r.parsed()) }); ok {
-			return r, nil
+		if found, ok = pick(func(r nodeRelease) bool { return r.isLTS() && satisfiesNPM(want, r.parsed()) }); !ok {
+			found, ok = pick(func(r nodeRelease) bool { return satisfiesNPM(want, r.parsed()) })
 		}
 	}
-	return nodeRelease{}, fmt.Errorf("no Node.js release matches %q for %s", want, flavor)
+	if !ok {
+		return nodeRelease{}, fmt.Errorf("%w: %q for %s", errNoRelease, want, flavor)
+	}
+	return found, nil
 }
 
 func nodeArch() (string, error) {
@@ -78,6 +83,9 @@ func glibcVersion(e *Env) (Version, bool) {
 	out, err := e.Exec("getconf", "GNU_LIBC_VERSION")
 	if err != nil {
 		out, _ = e.Exec("ldd", "--version")
+	}
+	if strings.Contains(strings.ToLower(out), "musl") {
+		return Version{}, false
 	}
 	m := regexp.MustCompile(`(\d+\.\d+)`).FindString(out)
 	if m == "" {
@@ -153,12 +161,17 @@ func nodeInstall(e *Env, want, dir string) error {
 			return fmt.Errorf("this server has glibc %s, too old for Node.js 18+, and no compatible build exists for %s", glibc.MajorMinor(), arch)
 		}
 		e.note("This server has glibc %s, too old for official Node.js 18+ builds. Using the glibc 2.17 build from unofficial-builds.nodejs.org.", glibc.MajorMinor())
-		sources = []nodeSource{legacy}
+		sources = []nodeSource{legacy, official}
 	}
+	linked, _ := filepath.EvalSymlinks(filepath.Join(e.dataDir(), "node", "current"))
 
 	var lastErr error
 	for i, source := range sources {
 		release, dest, err := fetchNode(e, source, want)
+		if errors.Is(err, errNoRelease) && i+1 < len(sources) {
+			lastErr = err
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -166,10 +179,12 @@ func nodeInstall(e *Env, want, dir string) error {
 		if err == nil {
 			return linkNode(e, release, dest)
 		}
-		os.RemoveAll(dest)
+		if real, _ := filepath.EvalSymlinks(dest); real != linked {
+			os.RemoveAll(dest)
+		}
 		lastErr = fmt.Errorf("Node.js %s (%s) does not run on this server: %s", release.Version, source.flavor, firstLine(out, err))
 		if i+1 < len(sources) {
-			e.note("%v. Trying the glibc 2.17 build, which needs fewer system libraries.", lastErr)
+			e.note("%v. Trying the other build.", lastErr)
 		}
 	}
 	return lastErr

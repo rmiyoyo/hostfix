@@ -42,12 +42,19 @@ download "$url" "$tmp"
 download "$url.sha256" "$sum"
 
 if command -v sha256sum >/dev/null 2>&1; then
-    expected="$(cut -d' ' -f1 "$sum")"
     actual="$(sha256sum "$tmp" | cut -d' ' -f1)"
-    if [ "$expected" != "$actual" ]; then
-        echo "hostfix: checksum mismatch, not installing" >&2
-        exit 1
-    fi
+elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+elif command -v openssl >/dev/null 2>&1; then
+    actual="$(openssl dgst -sha256 "$tmp" | sed 's/.*= *//')"
+else
+    echo "hostfix: no sha256sum, shasum or openssl to verify the download, not installing" >&2
+    exit 1
+fi
+expected="$(cut -d' ' -f1 "$sum")"
+if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    echo "hostfix: checksum mismatch, not installing" >&2
+    exit 1
 fi
 
 chmod 755 "$tmp"

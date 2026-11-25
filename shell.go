@@ -24,7 +24,12 @@ case "$PATH" in
 esac
 ` + blockEnd + "\n"
 
-var oldAlias = regexp.MustCompile(`^alias (php|composer)=.*/opt/cpanel/`)
+const loginLine = `[ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"`
+
+var (
+	oldAlias      = regexp.MustCompile(`^alias (php|composer)=.*/opt/cpanel/`)
+	sourcesBashrc = regexp.MustCompile(`(?m)^[^#\n]*(?:^|[\s;&|])(?:\.|source)\s+["']?(?:\$HOME|~|\$\{HOME\})/\.bashrc`)
+)
 
 func setupShell(e *Env, quiet bool) error {
 	bashrc := filepath.Join(e.Home, ".bashrc")
@@ -32,23 +37,14 @@ func setupShell(e *Env, quiet bool) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	var kept []string
-	skip := false
-	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case trimmed == blockBegin || trimmed == oldBlockBegin:
-			skip = true
-		case trimmed == blockEnd || trimmed == oldBlockEnd:
-			skip = false
-		case skip || oldAlias.MatchString(trimmed):
-		default:
-			kept = append(kept, line)
-		}
+	kept, err := stripBlock(string(data), oldBlockBegin, oldBlockEnd)
+	if err == nil {
+		kept, err = stripBlock(strings.Join(kept, "\n"), blockBegin, blockEnd)
 	}
-	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
-		kept = kept[:len(kept)-1]
+	if err != nil {
+		return errors.New("~/.bashrc: " + err.Error())
 	}
+	kept = slicesDelete(kept, func(line string) bool { return oldAlias.MatchString(strings.TrimSpace(line)) })
 	content := shellBlock
 	if len(kept) > 0 {
 		content = strings.Join(kept, "\n") + "\n\n" + shellBlock
@@ -58,7 +54,7 @@ func setupShell(e *Env, quiet bool) error {
 		if _, err := backup(e, bashrc); err != nil {
 			return err
 		}
-		if err := writeFileKeepMode(bashrc, []byte(content), 0o644); err != nil {
+		if err := writeFileAtomic(bashrc, []byte(content), 0o644); err != nil {
 			return err
 		}
 		changed = true
@@ -80,10 +76,20 @@ func setupShell(e *Env, quiet bool) error {
 			e.say("  %s now loads ~/.bashrc, so login shells pick it up too", login)
 		}
 		if changed {
-			e.say("  Run `source ~/.bashrc` or reconnect to use it now")
+			e.say("  Open a new SSH session to use it")
 		}
 	}
 	return nil
+}
+
+func slicesDelete(lines []string, drop func(string) bool) []string {
+	out := lines[:0]
+	for _, line := range lines {
+		if !drop(line) {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func isOldSymlink(path string) bool {
@@ -105,15 +111,18 @@ func ensureLoginSourcesBashrc(e *Env) (string, error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if strings.Contains(string(data), ".bashrc") {
+	if sourcesBashrc.Match(data) {
 		return "", nil
 	}
 	content := string(data)
 	if content != "" && !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
-	content += "[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n"
-	if err := writeFileKeepMode(path, []byte(content), 0o644); err != nil {
+	content += loginLine + "\n"
+	if _, err := backup(e, path); err != nil {
+		return "", err
+	}
+	if err := writeFileAtomic(path, []byte(content), 0o644); err != nil {
 		return "", err
 	}
 	return "~/" + name, nil

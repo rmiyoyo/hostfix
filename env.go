@@ -87,8 +87,27 @@ func (e *Env) lookPath(name string) string {
 	return ""
 }
 
-func (e *Env) prependPath(dir string) {
-	e.Path = dir + string(os.PathListSeparator) + e.Path
+func (e *Env) pathFirst(dir string) {
+	kept := []string{dir}
+	for _, p := range filepath.SplitList(e.Path) {
+		if p != "" && filepath.Clean(p) != filepath.Clean(dir) {
+			kept = append(kept, p)
+		}
+	}
+	e.Path = strings.Join(kept, string(os.PathListSeparator))
+}
+
+func (e *Env) inPath(dir string) bool {
+	for _, p := range filepath.SplitList(e.Path) {
+		if p != "" && filepath.Clean(p) == filepath.Clean(dir) {
+			return true
+		}
+	}
+	return false
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func isExecutable(path string) bool {
@@ -117,16 +136,43 @@ func replaceSymlink(target, link string) error {
 	return os.Rename(tmp, link)
 }
 
-func writeFileKeepMode(path string, data []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".hostfix-*")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
+	_, werr := tmp.Write(data)
+	if werr == nil {
+		werr = tmp.Sync()
 	}
-	return f.Close()
+	if cerr := tmp.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Chmod(tmp.Name(), mode)
+	}
+	if werr == nil {
+		werr = os.Rename(tmp.Name(), path)
+	}
+	if werr != nil {
+		os.Remove(tmp.Name())
+	}
+	return werr
+}
+
+func uniquePath(e *Env, path string) string {
+	base := path + ".hostfix-" + e.Now().Format("20060102-150405")
+	name := base
+	for i := 2; exists(name); i++ {
+		name = fmt.Sprintf("%s-%d", base, i)
+	}
+	return name
 }
 
 func backup(e *Env, path string) (string, error) {
@@ -137,8 +183,17 @@ func backup(e *Env, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	name := path + ".hostfix-" + e.Now().Format("20060102-150405")
+	name := uniquePath(e, path)
 	return name, os.WriteFile(name, data, 0o600)
+}
+
+func moveAside(e *Env, path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		return "", nil
+	}
+	name := uniquePath(e, path)
+	return name, os.Rename(path, name)
 }
 
 func tildePath(e *Env, path string) string {

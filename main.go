@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -42,6 +43,19 @@ func run(e *Env, args []string) int {
 		return 0
 	}
 	flags, rest := splitFlags(args[1:])
+	allowed := map[string][]string{"perms": {"dry-run", "n"}, "laravel": {"yes", "y", "force"}}
+	for flag := range flags {
+		if !slices.Contains(allowed[args[0]], flag) {
+			fmt.Fprintf(e.Err, "hostfix: unknown option --%s for %q\n", flag, args[0])
+			return 2
+		}
+	}
+	if needsDir[args[0]] {
+		if err := checkDir(dirArg(rest)); err != nil {
+			fmt.Fprintf(e.Err, "%s %v\n", e.paint("31", "hostfix:"), err)
+			return 2
+		}
+	}
 	var err error
 	switch args[0] {
 	case "doctor":
@@ -94,6 +108,19 @@ func splitFlags(args []string) (map[string]bool, []string) {
 	return flags, rest
 }
 
+var needsDir = map[string]bool{"doctor": true, "fix": true, "perms": true, "cron": true}
+
+func checkDir(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("%s does not exist", dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a folder", dir)
+	}
+	return nil
+}
+
 func dirArg(args []string) string {
 	dir := "."
 	if len(args) > 0 {
@@ -113,9 +140,9 @@ func printCron(e *Env, dir string) error {
 		php = bins[len(bins)-1].Path
 	}
 	if isLaravel(dir) {
-		e.say("* * * * * cd %s && %s artisan schedule:run >> /dev/null 2>&1", dir, php)
+		e.say("* * * * * cd %s && %s artisan schedule:run >> /dev/null 2>&1", shellQuote(dir), shellQuote(php))
 	} else {
-		e.say("*/5 * * * * %s %s >> /dev/null 2>&1", php, filepath.Join(dir, "your-script.php"))
+		e.say("*/5 * * * * %s %s >> /dev/null 2>&1", shellQuote(php), shellQuote(filepath.Join(dir, "your-script.php")))
 	}
 	e.say("")
 	e.say("Paste this in cPanel > Cron Jobs. Cron does not read ~/.bashrc, so it needs the full PHP path;")

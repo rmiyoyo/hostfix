@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 )
 
@@ -15,24 +16,71 @@ type permChange struct {
 }
 
 const (
-	reasonWritable = "group or world writable (suEXEC and suPHP refuse these with a 500 error)"
-	reasonOwner    = "not readable or writable by you"
+	reasonForeign  = "owned by another user, so hostfix cannot change them (ask your host to give them back to you)"
 	reasonBin      = "node_modules/.bin tool is not executable (\"Permission denied\")"
+	reasonWritable = "group or world writable (suEXEC and suPHP refuse these with a 500 error)"
+	reasonWeb      = "not readable by the web server (403 Forbidden for images, CSS and JS)"
+	reasonOwner    = "not readable by you, or not writable where Laravel writes"
 )
+
+var reasonOrder = []string{reasonForeign, reasonBin, reasonWritable, reasonWeb, reasonOwner}
+
+func fileOwner(info fs.FileInfo) (int, bool) {
+	v := reflect.ValueOf(info.Sys())
+	if v.Kind() == reflect.Pointer && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return 0, false
+	}
+	uid := v.FieldByName("Uid")
+	if !uid.IsValid() || !uid.CanUint() {
+		return 0, false
+	}
+	return int(uid.Uint()), true
+}
+
+func underAny(path string, roots []string) bool {
+	for _, root := range roots {
+		if path == root || strings.HasPrefix(path, root+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
 
 func planPerms(dir string) ([]permChange, error) {
 	if real, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = real
 	}
-	modes := map[string]fs.FileMode{}
-	var order []string
+	var public, writableRoots []string
+	traverse := map[string]bool{}
+	if isLaravel(dir) {
+		writableRoots = []string{filepath.Join(dir, "storage"), filepath.Join(dir, "bootstrap", "cache")}
+		if p := filepath.Join(dir, "public"); exists(p) {
+			public = append(public, p)
+			traverse[dir] = true
+		}
+	}
+	if filepath.Base(dir) == "public_html" {
+		public = append(public, dir)
+	}
+	me := os.Getuid()
+
+	var changes []permChange
 	binTargets := map[string]bool{}
+	type entry struct {
+		path string
+		info fs.FileInfo
+	}
+	var entries []entry
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
+		inBin := filepath.Base(filepath.Dir(path)) == ".bin" && strings.Contains(path, "node_modules")
 		if d.Type()&fs.ModeSymlink != 0 {
-			if filepath.Base(filepath.Dir(path)) == ".bin" && strings.Contains(path, "node_modules") {
+			if inBin {
 				if target, err := filepath.EvalSymlinks(path); err == nil && strings.HasPrefix(target, dir) {
 					binTargets[target] = true
 				}
@@ -43,37 +91,63 @@ func planPerms(dir string) ([]permChange, error) {
 		if err != nil {
 			return nil
 		}
-		modes[path] = info.Mode()
-		order = append(order, path)
+		if inBin && info.Mode().IsRegular() {
+			binTargets[path] = true
+		}
+		entries = append(entries, entry{path, info})
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	var changes []permChange
-	for _, path := range order {
-		mode := modes[path]
+	for _, en := range entries {
+		mode := en.info.Mode()
+		if !mode.IsDir() && !mode.IsRegular() {
+			continue
+		}
 		perm := mode.Perm()
 		want := perm &^ 0o022
 		reason := ""
 		if want != perm {
 			reason = reasonWritable
 		}
+		owner, writable := 0o400, underAny(en.path, writableRoots)
 		if mode.IsDir() {
-			want |= 0o700
-		} else {
-			want |= 0o600
+			owner = 0o500
 		}
-		if reason == "" && want != perm&^0o022 {
-			reason = reasonOwner
+		if writable {
+			owner |= 0o200
 		}
-		if mode.IsRegular() && binTargets[path] && want&0o100 == 0 {
+		if want|fs.FileMode(owner) != want {
+			want |= fs.FileMode(owner)
+			if reason == "" {
+				reason = reasonOwner
+			}
+		}
+		if underAny(en.path, public) || (mode.IsDir() && traverse[en.path]) {
+			extra := fs.FileMode(0o004)
+			if mode.IsDir() {
+				extra = 0o001
+			}
+			if want&extra == 0 {
+				want |= extra
+				if reason == "" || reason == reasonOwner {
+					reason = reasonWeb
+				}
+			}
+		}
+		if mode.IsRegular() && binTargets[en.path] && want&0o100 == 0 {
 			want |= 0o100
 			reason = reasonBin
 		}
-		if want != perm {
-			changes = append(changes, permChange{Path: path, From: perm, To: want, Reason: reason})
+		if want == perm {
+			continue
 		}
+		if uid, ok := fileOwner(en.info); ok && me >= 0 && uid != me {
+			changes = append(changes, permChange{Path: en.path, From: perm, To: perm, Reason: reasonForeign})
+			continue
+		}
+		changes = append(changes, permChange{Path: en.path, From: perm, To: want, Reason: reason})
 	}
 	return changes, nil
 }
@@ -88,26 +162,36 @@ func fixPerms(e *Env, dir string, dryRun bool) error {
 		return nil
 	}
 	counts := map[string]int{}
-	for i, c := range changes {
+	shown := 0
+	for _, c := range changes {
+		if c.Reason == reasonForeign {
+			counts[c.Reason]++
+			continue
+		}
 		if dryRun {
-			if i < 50 {
+			if shown < 50 {
 				e.say("  %s %o -> %o", tildePath(e, c.Path), c.From, c.To)
 			}
+			shown++
 		} else if err := os.Chmod(c.Path, c.To); err != nil {
 			e.note("could not change %s: %v", tildePath(e, c.Path), err)
 			continue
 		}
 		counts[c.Reason]++
 	}
-	if dryRun && len(changes) > 50 {
-		e.say("  ...and %d more", len(changes)-50)
+	if dryRun && shown > 50 {
+		e.say("  ...and %d more", shown-50)
 	}
 	verb := "Fixed"
 	if dryRun {
 		verb = "Would fix"
 	}
-	for _, reason := range []string{reasonWritable, reasonOwner, reasonBin} {
-		if counts[reason] > 0 {
+	for _, reason := range reasonOrder {
+		switch {
+		case counts[reason] == 0:
+		case reason == reasonForeign:
+			e.note("%s: %s", plural(counts[reason], "path"), reason)
+		default:
 			e.done("%s %s: %s", verb, plural(counts[reason], "path"), reason)
 		}
 	}

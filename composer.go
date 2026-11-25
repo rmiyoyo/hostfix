@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 const cpanelComposer = "/opt/cpanel/composer/bin/composer"
@@ -25,20 +26,39 @@ func writeComposerWrapper(e *Env) error {
 		return nil
 	}
 	script := fmt.Sprintf(`#!/bin/sh
+%s
 export COMPOSER_MEMORY_LIMIT="${COMPOSER_MEMORY_LIMIT:--1}"
 PHP="$HOME/.local/bin/php"
 [ -x "$PHP" ] || PHP=php
-exec "$PHP" %q "$@"
-`, phar)
+exec "$PHP" %s "$@"
+`, wrapperMark, shellQuote(phar))
 	if err := os.MkdirAll(e.binDir(), 0o755); err != nil {
 		return err
 	}
 	path := filepath.Join(e.binDir(), "composer")
-	if err := writeFileKeepMode(path, []byte(script), 0o755); err != nil {
+	if data, err := os.ReadFile(path); err == nil && string(data) == script {
+		return nil
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if data, _ := os.ReadFile(path); info.Mode()&os.ModeSymlink != 0 || !strings.Contains(string(data), wrapperMark) {
+			saved := uniquePath(e, path)
+			if err := os.Rename(path, saved); err != nil {
+				return err
+			}
+			e.say("  Your previous %s was moved to %s", tildePath(e, path), tildePath(e, saved))
+		}
+	}
+	tmp := path + ".hostfix-tmp"
+	if err := os.WriteFile(tmp, []byte(script), 0o755); err != nil {
 		return err
 	}
-	return os.Chmod(path, 0o755)
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
+
+const wrapperMark = ": hostfix composer wrapper"
 
 func composerInstall(e *Env) error {
 	sums, err := fetch(e, e.ComposerURL+".sha256sum")

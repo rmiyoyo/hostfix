@@ -79,6 +79,14 @@ func extractTarGz(archive, dest string) error {
 	}
 	tr := tar.NewReader(gz)
 	root := filepath.Clean(dest) + string(os.PathSeparator)
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return err
+	}
+	realRoot, err := filepath.EvalSymlinks(dest)
+	if err != nil {
+		return err
+	}
+	realRoot = filepath.Clean(realRoot) + string(os.PathSeparator)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -97,6 +105,9 @@ func extractTarGz(archive, dest string) error {
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
+		}
+		if parent, err := filepath.EvalSymlinks(filepath.Dir(path)); err != nil || !strings.HasPrefix(parent+string(os.PathSeparator), realRoot) {
+			return fmt.Errorf("unsafe path in archive: %s", hdr.Name)
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
